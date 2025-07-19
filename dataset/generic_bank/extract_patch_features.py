@@ -15,7 +15,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # line5
 
 # 경로 설정
 input_dir = "/Users/kimhoeyeon/Desktop/my_project/dataset/Pretrain_Images/test_50/"
-output_dir = "./patch_features"
+output_dir = "/Users/kimhoeyeon/Desktop/my_project/dataset/generic_bank/"
 os.makedirs(output_dir, exist_ok=True)
 
 # 512x512용 전처리 정의
