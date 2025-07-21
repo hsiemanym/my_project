@@ -1,78 +1,119 @@
 import torch
-import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import torchvision.transforms as transforms
-import cv2
+import torchvision.models as models
+from torchvision import transforms
 from PIL import Image
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import cv2
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-# ─── 로딩 유틸 ─── #
-def load_patch_features(img_path, feat_path):
-    img = Image.open(img_path).convert("RGB").resize((512, 512))
-    feat = torch.load(feat_path)
-    feat = F.normalize(feat, dim=1)
-    return img, feat
+# 경로 설정
+TEST_IMG_PATH = "./dataset/test_test/test.png"
+TOP1_IMG_PATH = "./dataset/Pretrain_Images/test_50/005.jpg"
+TEST_PENALTY_PATH = "./semantic_masks/test_patch_penalty_layer3.pt"
+TOP1_PENALTY_PATH = "./semantic_masks/top1_patch_penalty_layer3.pt"
+SAVE_PATH = "./heatmaps_layer4.png"
 
-# ─── Grad-CAM++ 스타일 유사도 기반 히트맵 계산 ─── #
-def compute_patch_similarity_map(source_feat, target_feat, penalty):
-    sim = F.cosine_similarity(source_feat, target_feat, dim=1)  # [256]
-    weight = 1 - penalty                                        # [256]
-    sim_weighted = sim * weight
-    return sim, sim_weighted
+# 모델 불러오기
+resnet = models.resnet50(pretrained=True)
+resnet.eval()
 
-# ─── 16x16 → 512x512 부드러운 업샘플링 ─── #
-def upscale_heatmap(heatmap_16, target_size=(512, 512)):
-    heatmap = heatmap_16.view(16, 16).cpu().numpy()
-    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-    heatmap_resized = cv2.resize(heatmap, target_size, interpolation=cv2.INTER_CUBIC)
-    heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(heatmap_colored)
+# 이미지 로드 함수
+def load_image(img_path):
+    image = Image.open(img_path).convert('RGB')
+    transform = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor()
+    ])
+    return transform(image).unsqueeze(0)
 
-# ─── 이미지에 히트맵 합성 ─── #
-def overlay_heatmap(img, heatmap, alpha=0.5):
-    img = img.convert("RGB").resize((512, 512))
-    return Image.blend(img, heatmap, alpha)
+# Grad-CAM 생성 함수
+def get_gradcam_map(model, img_tensor, target_layer):
+    activations = []
+    gradients = []
 
-# ─── 전체 시각화 ─── #
-def visualize_4_heatmaps(test_img_path, top1_img_path,
-                         test_feat_path, top1_feat_path,
-                         penalty_path):
+    def fwd_hook(module, input, output):
+        activations.append(output)
 
-    penalty = torch.load(penalty_path)  # [256]
-    test_img, test_feat = load_patch_features(test_img_path, test_feat_path)
-    top1_img, top1_feat = load_patch_features(top1_img_path, top1_feat_path)
+    def bwd_hook(module, grad_in, grad_out):
+        gradients.append(grad_out[0])
 
-    sim, sim_weighted = compute_patch_similarity_map(test_feat, top1_feat, penalty)
+    handle_fwd = target_layer.register_forward_hook(fwd_hook)
+    handle_bwd = target_layer.register_backward_hook(bwd_hook)
 
-    # Grad-CAM++ 스타일 heatmap
-    test_factual_hm = upscale_heatmap(sim_weighted)
-    test_counter_hm = upscale_heatmap(1 - sim)
-    top1_factual_hm = upscale_heatmap(sim_weighted)
-    top1_counter_hm = upscale_heatmap(1 - sim)
+    output = model(img_tensor)
+    class_idx = torch.argmax(output)
+    score = output[:, class_idx]
+    score.backward()
 
-    # 이미지와 합성
-    test_factual = overlay_heatmap(test_img, test_factual_hm)
-    test_counter = overlay_heatmap(test_img, test_counter_hm)
-    top1_factual = overlay_heatmap(top1_img, top1_factual_hm)
-    top1_counter = overlay_heatmap(top1_img, top1_counter_hm)
+    handle_fwd.remove()
+    handle_bwd.remove()
 
-    # 시각화
-    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
-    axs = axs.flatten()
-    axs[0].imshow(test_factual); axs[0].set_title("Test – Factual")
-    axs[1].imshow(test_counter); axs[1].set_title("Test – Counterfactual")
-    axs[2].imshow(top1_factual); axs[2].set_title("Top-1 – Factual")
-    axs[3].imshow(top1_counter); axs[3].set_title("Top-1 – Counterfactual")
-    for ax in axs: ax.axis('off')
-    plt.tight_layout()
-    plt.show()
+    grads = gradients[0]  # [1, C, H, W]
+    acts = activations[0]  # [1, C, H, W]
+
+    weights = grads.mean(dim=(2, 3), keepdim=True)  # GAP
+    cam = (weights * acts).sum(dim=1).squeeze()  # [H, W]
+    cam = torch.relu(cam)
+
+    # 📌 percentile 기반 정규화
+    cam_np = cam.detach().cpu().numpy()
+    p_min, p_max = np.percentile(cam_np, 5), np.percentile(cam_np, 95)
+    cam_np = np.clip(cam_np, p_min, p_max)
+    cam_np = (cam_np - p_min) / (p_max - p_min + 1e-8)
+
+    # ✅ 여기가 핵심!
+    cam_np = cv2.resize(cam_np, (512, 512))  # 512x512로 업샘플링
+
+    return cam_np  # [512, 512] numpy
 
 
-visualize_4_heatmaps(
-    test_img_path="dataset/test_test/test.png",
-    top1_img_path="dataset/Pretrain_Images/test_50/005.jpg",
-    test_feat_path="dataset/test_test/test_patch.pt",
-    top1_feat_path="dataset/test_test/top1_patch.pt",
-    penalty_path="semantic_masks/test_patch_penalty_cdf.pt"
-)
+# Heatmap 오버레이
+def overlay_heatmap(cam, img_tensor):
+    cam = cv2.resize(cam, (512, 512))
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    heatmap = Image.fromarray(heatmap).convert("RGBA")
+
+    orig = img_tensor.squeeze().permute(1, 2, 0).cpu().numpy()
+    orig = (orig * 255).astype(np.uint8)
+    orig_img = Image.fromarray(orig).convert("RGBA")
+
+    return Image.blend(orig_img, heatmap, alpha=0.5)
+
+# Penalty 적용
+# Counterfactual 생성 시 penalty resize 추가
+def apply_penalty(cam, penalty):
+    penalty = torch.clamp(penalty, 0, 1).cpu().numpy()
+    penalty_resized = cv2.resize(penalty, (512, 512))  # ✅ 업샘플링
+    return cam * (1 - penalty_resized)
+
+# 로드
+test_img = load_image(TEST_IMG_PATH)
+top1_img = load_image(TOP1_IMG_PATH)
+test_penalty = torch.load(TEST_PENALTY_PATH).view(32, 32)
+top1_penalty = torch.load(TOP1_PENALTY_PATH).view(32, 32)
+
+# CAM 생성
+cam_test = get_gradcam_map(resnet, test_img, resnet.layer4)
+cam_top1 = get_gradcam_map(resnet, top1_img, resnet.layer4)
+
+# Counterfactual
+cam_test_cf = apply_penalty(cam_test, test_penalty)
+cam_top1_cf = apply_penalty(cam_top1, top1_penalty)
+
+# 시각화
+fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+titles = ['Test - Factual', 'Test - Counterfactual', 'Top-1 - Factual', 'Top-1 - Counterfactual']
+images = [test_img, test_img, top1_img, top1_img]
+cams = [cam_test, cam_test_cf, cam_top1, cam_top1_cf]
+
+for ax, title, img, cam in zip(axs.flatten(), titles, images, cams):
+    heatmap_img = overlay_heatmap(cam, img)
+    ax.imshow(heatmap_img)
+    ax.set_title(title)
+    ax.axis('off')
+
+plt.tight_layout()
+plt.savefig(SAVE_PATH)
+print(f"✅ 저장 완료: {SAVE_PATH}")
